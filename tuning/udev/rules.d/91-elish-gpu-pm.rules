@@ -1,0 +1,2 @@
+# Relax Adreno 650 GPU runtime autosuspend from Linux default 66ms to 500ms
+ACTION=="add|change", SUBSYSTEM=="platform", KERNEL=="3d00000.gpu", ATTR{power/autosuspend_delay_ms}="500"

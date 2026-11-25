@@ -1,0 +1,39 @@
+From: elish-linux-tuning contributors
+Subject: [PATCH 2/2] ASoC: cs35l41: poll raw IRQ1 status and tolerate boost timeout in cs35l41_global_enable
+
+On Xiaomi Mi Pad 5 Pro (xiaomi-elish) running Linux 6.18, the 8x CS35L41
+amplifiers use internal boost (CS35L41_INT_BOOST). In cs35l41_global_enable():
+1. Polling CS35L41_IRQ1_STATUS1 (0x10010) never observes CS35L41_PUP_DONE_MASK
+   because the interrupt is masked; polling CS35L41_IRQ1_RAW_STATUS1 (0x10090)
+   reads the unmasked hardware status.
+2. If PUP_DONE still times out (-ETIMEDOUT / -110), returning the error aborts
+   DAPM and keeps all 8 speakers silent. Logging the warning and resetting
+   ret = 0 allows audio playback to proceed.
+
+Target file: sound/soc/codecs/cs35l41-lib.c (function cs35l41_global_enable)
+
+---
+ sound/soc/codecs/cs35l41-lib.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/sound/soc/codecs/cs35l41-lib.c b/sound/soc/codecs/cs35l41-lib.c
+--- a/sound/soc/codecs/cs35l41-lib.c
++++ b/sound/soc/codecs/cs35l41-lib.c
+@@ -1120,11 +1120,13 @@ int cs35l41_global_enable(struct device *dev, struct regmap *regmap, enum cs35l4
+ 			return ret;
+ 		}
+ 
+-		ret = regmap_read_poll_timeout(regmap, CS35L41_IRQ1_STATUS1,
++		ret = regmap_read_poll_timeout(regmap, CS35L41_IRQ1_RAW_STATUS1,
+ 					       val, val & CS35L41_PUP_DONE_MASK,
+ 					       1000, 100000);
+-		if (ret)
++		if (ret) {
+ 			dev_err(dev, "PUP_DONE not set: %d\n", ret);
++			ret = 0;
++		}
+ 		break;
+ 	case CS35L41_EXT_BOOST:
+ 	case CS35L41_EXT_BOOST_NO_VSPK_SWITCH:
+-- 
+2.43.0

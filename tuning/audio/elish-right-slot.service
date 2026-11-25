@@ -1,0 +1,12 @@
+[Unit]
+Description=Route the right channel to the right CS35L41 speakers and keep PLL locked
+After=sound.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/elish-right-slot.sh
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

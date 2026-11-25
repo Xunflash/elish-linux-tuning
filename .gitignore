@@ -1,0 +1,8 @@
+*.o
+*.so
+*.orig
+*.bak
+.DS_Store
+*~
+/build/
+/tmp/

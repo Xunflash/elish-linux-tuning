@@ -1,0 +1,12 @@
+[Unit]
+Description=Rebind SM8250 LPASS LPI pinctrl (33c0000.pinctrl) for Xiaomi magnetic keyboard USB PHY
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/elish-keyboard-pinctrl.sh
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target

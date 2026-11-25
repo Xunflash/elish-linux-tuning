@@ -1,0 +1,19 @@
+[Unit]
+Description=Start sched_ext BPF scheduler (scx_cosmos)
+ConditionPathIsDirectory=/sys/kernel/sched_ext
+After=multi-user.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/scx
+ExecStart=/bin/bash -c 'exec ${SCX_SCHEDULER_OVERRIDE:-$SCX_SCHEDULER} ${SCX_FLAGS_OVERRIDE:-$SCX_FLAGS}'
+Restart=on-failure
+RestartSec=3
+LimitMEMLOCK=infinity
+OOMScoreAdjust=-900
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

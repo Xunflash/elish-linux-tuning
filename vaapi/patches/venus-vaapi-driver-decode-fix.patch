@@ -1,0 +1,602 @@
+From 3c84774ee39c6fb1ab092c1ba824f7b1467d1f10 Mon Sep 17 00:00:00 2001
+From: Xunflash <71567536+Xunflash@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 01:22:57 +0800
+Subject: [PATCH] fix: eliminate green flashes and out-of-order frames in Venus
+ VA-API decode
+
+Fixes green frame flashes, stale/out-of-order frames (jumping back to
+earlier frames), and 30s sync timeouts on H.264 B-frame streams in
+Chromium VA-API and mpv/FFmpeg on Qualcomm Venus stateful decoders:
+
+- Enable decode-order zero-delay output (V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY=0
+  and DISPLAY_DELAY_ENABLE=1) for all decode formats (not only HEVC), so
+  Venus emits frames immediately in decode order matching VA-API's DPB.
+- Track decode submissions with a unique monotonic 64-bit tag
+  ((decode_sequence << 8) | surface_slot) so stale/cancelled frames can
+  never overwrite a recycled VA surface.
+- Complete the decoded CPU-to-DMABUF copy in vaEndPicture (with a short
+  non-blocking wait for invisible VP9 show_frame=0 frames) and sync
+  pending decodes in vaExportSurfaceHandle / vaDeriveImage / vaGetImage.
+- Initialize newly allocated NV12/P010 surfaces to true video black
+  (Y=0x10, UV=0x80 / 0x1000, 0x8000) instead of all-zero (which renders
+  bright green in YUV->RGB), and drop the redundant per-frame zero-fill
+  before row memcpy in venus_surface_copy_from_yuv420.
+- Query V4L2_CID_MIN_BUFFERS_FOR_CAPTURE (adding headroom), always
+  re-queue CAPTURE buffers even when a frame callback skips/errors,
+  reconfigure CAPTURE on mid-stream V4L2_EVENT_SOURCE_CHANGE, avoid
+  POLLOUT busy-spinning while OUTPUT slots are still free, raise
+  concurrent context/surface limits for multi-video pages, and emit
+  H.264 level_idc=51 for 1080p60/4K streams.
+---
+ src/backend_internal.h |  15 ++++--
+ src/decode.c           |  86 +++++++++++++++++++++++---------
+ src/h264_annexb.c      |   2 +-
+ src/objects.c          |  44 ++++++++++++++++-
+ src/v4l2_decoder.c     | 110 +++++++++++++++++++++++++----------------
+ 5 files changed, 184 insertions(+), 73 deletions(-)
+
+diff --git a/src/backend_internal.h b/src/backend_internal.h
+index 9c2995b..edd7d26 100644
+--- a/src/backend_internal.h
++++ b/src/backend_internal.h
+@@ -14,11 +14,11 @@
+ #include <va/va_enc_h264.h>
+ #include <va/va_enc_hevc.h>
+ 
+-#define VENUS_MAX_CONFIGS 16
+-#define VENUS_MAX_CONTEXTS 8
+-#define VENUS_MAX_SURFACES 64
+-#define VENUS_MAX_BUFFERS 512
+-#define VENUS_MAX_IMAGES 128
++#define VENUS_MAX_CONFIGS 32
++#define VENUS_MAX_CONTEXTS 16
++#define VENUS_MAX_SURFACES 192
++#define VENUS_MAX_BUFFERS 1024
++#define VENUS_MAX_IMAGES 256
+ #define VENUS_MAX_PENDING_BUFFERS 128
+ 
+ #define VENUS_CONFIG_BASE 0x01000000u
+@@ -69,6 +69,7 @@ struct venus_surface {
+     bool gpu_native;
+     bool ready;
+     bool encode_pending;
++    uint64_t decode_tag;
+     VABufferID coded_buffer_id;
+     VAContextID context_id;
+ };
+@@ -131,6 +132,7 @@ struct venus_context {
+     size_t encode_queue_count;
+     uint32_t encode_frames_per_second;
+     uint32_t encode_vp8_profile;
++    uint64_t decode_sequence;
+     uint64_t encode_sequence;
+     uint64_t encode_delivery_sequence;
+ };
+@@ -204,6 +206,9 @@ void venus_decode_fill_vtable(struct VADriverVTable *vtable);
+ void venus_decode_destroy_all(struct venus_backend *backend);
+ int venus_decode_store_frame_locked(
+     const struct venus_v4l2_frame *frame, void *opaque);
++VAStatus venus_decode_sync_surface_locked(
++    struct venus_backend *backend, struct venus_surface *surface,
++    int timeout_ms);
+ 
+ VAStatus venus_encode_end_picture_locked(
+     struct venus_backend *backend, struct venus_context *context,
+diff --git a/src/decode.c b/src/decode.c
+index 2cdb6fe..fbdca16 100644
+--- a/src/decode.c
++++ b/src/decode.c
+@@ -17,6 +17,8 @@
+ #define VENUS_MAX_SLICE_BATCHES 64
+ #define VENUS_ACCESS_UNIT_OVERHEAD 4096u
+ #define VENUS_SYNC_TIMEOUT_MS 30000
++_Static_assert(VENUS_MAX_SURFACES <= 255u,
++               "VENUS_MAX_SURFACES must fit in 8-bit decode_tag slot");
+ 
+ /*
+  * VA decode collects picture and slice buffers during Begin/Render/EndPicture.
+@@ -56,22 +58,26 @@ int venus_decode_store_frame_locked(
+ {
+     struct venus_backend *backend = opaque;
+     struct venus_surface *surface;
++    VASurfaceID surface_id;
+     uint32_t stride;
+     uint32_t row_bytes;
+     size_t source_uv_offset;
+     int status;
+ 
+-    if (!frame || frame->tag > UINT32_MAX ||
+-        frame->width == 0 || frame->height == 0 ||
++    if (!frame || frame->width == 0 || frame->height == 0 ||
+         (frame->width & 1u) || (frame->height & 1u))
+         return -EINVAL;
+-    if (frame->flags & V4L2_BUF_FLAG_ERROR)
+-        return -EIO;
+ 
+-    surface = venus_backend_find_surface(
+-        backend, (VASurfaceID)frame->tag);
+-    if (!surface)
+-        return -ENOENT;
++    surface_id = VENUS_SURFACE_BASE | (VASurfaceID)(frame->tag & 0xffu);
++    surface = venus_backend_find_surface(backend, surface_id);
++    if (!surface || surface->decode_tag != frame->tag)
++        return 0;
++
++    if (frame->flags & V4L2_BUF_FLAG_ERROR) {
++        surface->ready = true;
++        return 0;
++    }
++
+     if (surface->width > frame->width ||
+         surface->height > frame->height)
+         return -EINVAL;
+@@ -179,7 +185,7 @@ static VAStatus backend_create_context(
+                                       ? 8u * 1024u * 1024u
+                                       : 2u * 1024u * 1024u,
+             .output_buffers = 4,
+-            .capture_buffers = 16,
++            .capture_buffers = 20,
+         };
+ 
+         status = venus_v4l2_decoder_open(
+@@ -201,6 +207,7 @@ static VAStatus backend_create_context(
+     context->backend = backend;
+     context->height = (unsigned int)picture_height;
+     context->target = VA_INVALID_ID;
++    context->decode_sequence = 1;
+     context->encode_delivery_sequence = 1;
+ 
+     for (index = 0; index < (unsigned int)num_render_targets; index++) {
+@@ -327,6 +334,7 @@ static VAStatus backend_begin_picture(VADriverContextP driver_context,
+     if (config->entrypoint == VAEntrypointVLD) {
+         surface->ready = false;
+         surface->data_size = 0;
++        surface->decode_tag = 0;
+     }
+ 
+     pthread_mutex_unlock(&backend->mutex);
+@@ -535,7 +543,7 @@ static int collect_hevc_buffers(
+ static int collect_vpx_frame(
+     struct venus_backend *backend, struct venus_context *context,
+     VAProfile profile, const uint8_t **data, size_t *size,
+-    uint8_t **owned_data)
++    uint8_t **owned_data, bool *wait_for_frame)
+ {
+     const VAPictureParameterBufferVP8 *vp8_picture = NULL;
+     const VADecPictureParameterBufferVP9 *vp9_picture = NULL;
+@@ -546,6 +554,7 @@ static int collect_vpx_frame(
+     *data = NULL;
+     *size = 0;
+     *owned_data = NULL;
++    *wait_for_frame = true;
+     for (index = 0; index < context->pending_count; index++) {
+         const struct venus_buffer *buffer = venus_backend_find_buffer(
+             backend, context->pending[index]);
+@@ -666,6 +675,7 @@ static int collect_vpx_frame(
+             return -EINVAL;
+         if (((*data)[0] & 0xf0u) != 0x80u)
+             return -ENOTSUP;
++        *wait_for_frame = vp9_picture->pic_fields.bits.show_frame != 0;
+     }
+ 
+     return 0;
+@@ -684,11 +694,14 @@ static VAStatus backend_end_picture(VADriverContextP driver_context,
+         venus_backend_from_context(driver_context);
+     struct venus_context *context;
+     struct venus_config *config;
++    struct venus_surface *target_surface = NULL;
+     uint8_t *access_unit = NULL;
+     size_t access_unit_capacity;
+     size_t access_unit_size = 0;
+     size_t num_batches;
+     size_t num_hevc_slices;
++    uint64_t decode_tag = 0;
++    bool wait_for_frame = true;
+     int status;
+ 
+     if (!backend)
+@@ -722,6 +735,15 @@ static VAStatus backend_end_picture(VADriverContextP driver_context,
+         goto finish;
+     }
+ 
++    target_surface = venus_backend_find_surface(backend, context->target);
++    if (!target_surface) {
++        status = -EINVAL;
++        goto finish;
++    }
++    decode_tag = (context->decode_sequence++ << 8) |
++                 (uint64_t)(context->target & 0xffu);
++    target_surface->decode_tag = decode_tag;
++
+     if (config->profile == VAProfileVP8Version0_3 ||
+         config->profile == VAProfileVP9Profile0) {
+         const uint8_t *frame;
+@@ -729,12 +751,12 @@ static VAStatus backend_end_picture(VADriverContextP driver_context,
+         status = collect_vpx_frame(backend, context,
+                                    config->profile, &frame,
+                                    &access_unit_size,
+-                                   &access_unit);
++                                   &access_unit, &wait_for_frame);
+         if (status < 0)
+             goto finish;
+         status = venus_v4l2_decoder_submit(
+             context->decoder, frame, access_unit_size,
+-            context->target, venus_decode_store_frame_locked, backend);
++            decode_tag, venus_decode_store_frame_locked, backend);
+     } else if (config->profile == VAProfileHEVCMain ||
+                config->profile == VAProfileHEVCMain10) {
+         status = collect_hevc_buffers(
+@@ -750,7 +772,7 @@ static VAStatus backend_end_picture(VADriverContextP driver_context,
+             goto finish;
+         status = venus_v4l2_decoder_submit(
+             context->decoder, access_unit, access_unit_size,
+-            context->target, venus_decode_store_frame_locked, backend);
++            decode_tag, venus_decode_store_frame_locked, backend);
+         if (status == 0) {
+             venus_hevc_state_free(context->hevc_state);
+             context->hevc_state = next_hevc_state;
+@@ -777,7 +799,19 @@ static VAStatus backend_end_picture(VADriverContextP driver_context,
+ 
+         status = venus_v4l2_decoder_submit(
+             context->decoder, access_unit, access_unit_size,
+-            context->target, venus_decode_store_frame_locked, backend);
++            decode_tag, venus_decode_store_frame_locked, backend);
++    }
++
++    /*
++     * Complete the decoded CPU->DMABUF copy before vaEndPicture returns.
++     * Chromium's VaapiVideoDecoder reuses already-exported DMA-BUF surfaces
++     * and hands them directly to Viz GL after vaEndPicture without calling
++     * vaSyncSurface (expecting a kernel GPU fence). With DISPLAY_DELAY=0,
++     * Venus emits the decoded frame in ~1-3ms.
++     */
++    if (status == 0 && !target_surface->ready) {
++        (void)venus_decode_sync_surface_locked(
++            backend, target_surface, wait_for_frame ? 250 : 15);
+     }
+ 
+ finish:
+@@ -791,9 +825,9 @@ static VAStatus backend_end_picture(VADriverContextP driver_context,
+                       : VA_STATUS_SUCCESS;
+ }
+ 
+-static VAStatus sync_surface_locked(struct venus_backend *backend,
+-                                    struct venus_surface *surface,
+-                                    int timeout_ms)
++VAStatus venus_decode_sync_surface_locked(struct venus_backend *backend,
++                                          struct venus_surface *surface,
++                                          int timeout_ms)
+ {
+     struct venus_context *context;
+     int64_t deadline;
+@@ -810,10 +844,16 @@ static VAStatus sync_surface_locked(struct venus_backend *backend,
+         return VA_STATUS_ERROR_INVALID_CONTEXT;
+ 
+     deadline = monotonic_milliseconds() + timeout_ms;
+-    while (!surface->ready &&
+-           monotonic_milliseconds() < deadline) {
+-        int status = venus_v4l2_decoder_pump(
+-            context->decoder, 1000,
++    while (!surface->ready) {
++        int64_t remaining = deadline - monotonic_milliseconds();
++        int step_ms;
++        int status;
++
++        if (remaining <= 0)
++            break;
++        step_ms = remaining > 50 ? 50 : (int)remaining;
++        status = venus_v4l2_decoder_pump(
++            context->decoder, step_ms,
+             venus_decode_store_frame_locked, backend, NULL);
+ 
+         if (status == -ETIMEDOUT || status == -EAGAIN)
+@@ -844,7 +884,7 @@ static VAStatus backend_sync_surface(VADriverContextP driver_context,
+         return VA_STATUS_ERROR_INVALID_SURFACE;
+     }
+ 
+-    status = sync_surface_locked(
++    status = venus_decode_sync_surface_locked(
+         backend, surface, VENUS_SYNC_TIMEOUT_MS);
+     pthread_mutex_unlock(&backend->mutex);
+     return status;
+@@ -876,7 +916,7 @@ static VAStatus backend_sync_surface2(
+         return VA_STATUS_ERROR_INVALID_SURFACE;
+     }
+ 
+-    status = sync_surface_locked(
++    status = venus_decode_sync_surface_locked(
+         backend, surface, (int)timeout_ms);
+     pthread_mutex_unlock(&backend->mutex);
+     return status;
+diff --git a/src/h264_annexb.c b/src/h264_annexb.c
+index c39db23..4ff2525 100644
+--- a/src/h264_annexb.c
++++ b/src/h264_annexb.c
+@@ -131,7 +131,7 @@ static int append_sps(struct byte_writer *output, VAProfile profile,
+     venus_bits_init(&bits, rbsp, sizeof(rbsp));
+     venus_bits_write(&bits, (uint32_t)profile_value, 8);
+     venus_bits_write(&bits, constraint_flags(profile_value), 8);
+-    venus_bits_write(&bits, 41, 8);
++    venus_bits_write(&bits, 51, 8);
+     venus_bits_write_ue(&bits, 0);
+ 
+     if (profile_value == 100) {
+diff --git a/src/objects.c b/src/objects.c
+index 79a9774..2d650e6 100644
+--- a/src/objects.c
++++ b/src/objects.c
+@@ -130,6 +130,29 @@ static void release_surface(struct venus_surface *surface)
+     memset(surface, 0, sizeof(*surface));
+ }
+ 
++static void fill_surface_black(uint8_t *data, size_t uv_offset,
++                               size_t capacity, uint32_t fourcc)
++{
++    if (!data || uv_offset > capacity)
++        return;
++
++    if (fourcc == VA_FOURCC_P010) {
++        uint16_t *samples = (uint16_t *)data;
++        size_t y_count = uv_offset / sizeof(uint16_t);
++        size_t total_count = capacity / sizeof(uint16_t);
++        size_t i;
++
++        for (i = 0; i < y_count; i++)
++            samples[i] = 0x1000u;
++        for (i = y_count; i < total_count; i++)
++            samples[i] = 0x8000u;
++    } else {
++        /* NV12 video black is Y=16, U=128, V=128 (0x00 renders bright green). */
++        memset(data, 0x10, uv_offset);
++        memset(data + uv_offset, 0x80, capacity - uv_offset);
++    }
++}
++
+ static int allocate_dma_surface(struct venus_surface *surface,
+                                 unsigned int width,
+                                 unsigned int height,
+@@ -196,7 +219,7 @@ static int allocate_dma_surface(struct venus_surface *surface,
+         close(dma_fd);
+         return -saved_errno;
+     }
+-    memset(surface->data, 0, allocation_size);
++    fill_surface_black(surface->data, uv_offset, allocation_size, fourcc);
+     sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE;
+     if (xioctl(dma_fd, DMA_BUF_IOCTL_SYNC, &sync) < 0) {
+         saved_errno = errno;
+@@ -385,7 +408,6 @@ int venus_surface_copy_from_yuv420(
+     if (status < 0)
+         return status;
+ 
+-    memset(surface->data, 0, surface->capacity);
+     for (row = 0; row < height; row++)
+         memcpy(surface->data +
+                    (size_t)row * destination_stride,
+@@ -648,6 +670,8 @@ static VAStatus create_surfaces_locked(
+             surface->scanlines = height;
+             surface->uv_offset =
+                 (size_t)surface->stride * height;
++            fill_surface_black(surface->data, surface->uv_offset,
++                               surface->capacity, fourcc);
+         }
+ 
+         surface->used = true;
+@@ -1230,6 +1254,12 @@ static VAStatus backend_derive_image(VADriverContextP context,
+         pthread_mutex_unlock(&backend->mutex);
+         return VA_STATUS_ERROR_INVALID_SURFACE;
+     }
++    if (!surface->ready) {
++        if (!surface->encode_pending &&
++            surface->context_id != VA_INVALID_ID)
++            (void)venus_decode_sync_surface_locked(
++                backend, surface, 250);
++    }
+     if (!surface->ready) {
+         pthread_mutex_unlock(&backend->mutex);
+         return VA_STATUS_ERROR_SURFACE_BUSY;
+@@ -1304,6 +1334,12 @@ static VAStatus backend_get_image(
+         pthread_mutex_unlock(&backend->mutex);
+         return VA_STATUS_ERROR_INVALID_IMAGE_FORMAT;
+     }
++    if (!surface->ready) {
++        if (!surface->encode_pending &&
++            surface->context_id != VA_INVALID_ID)
++            (void)venus_decode_sync_surface_locked(
++                backend, surface, 250);
++    }
+     if (!surface->ready) {
+         pthread_mutex_unlock(&backend->mutex);
+         return VA_STATUS_ERROR_SURFACE_BUSY;
+@@ -1418,6 +1454,10 @@ static VAStatus backend_export_surface_handle(
+                         : VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+     }
+ 
++    if (!surface->ready && !surface->encode_pending &&
++        surface->context_id != VA_INVALID_ID)
++        (void)venus_decode_sync_surface_locked(backend, surface, 250);
++
+     exported_fd =
+         fcntl(surface->dma_fd, F_DUPFD_CLOEXEC, 0);
+     if (exported_fd < 0) {
+diff --git a/src/v4l2_decoder.c b/src/v4l2_decoder.c
+index 56cf60a..d7e11b1 100644
+--- a/src/v4l2_decoder.c
++++ b/src/v4l2_decoder.c
+@@ -282,6 +282,10 @@ static void stream_off(struct venus_v4l2_decoder *decoder,
+ 
+ static int setup_capture(struct venus_v4l2_decoder *decoder)
+ {
++    struct v4l2_control min_buffers = {
++        .id = V4L2_CID_MIN_BUFFERS_FOR_CAPTURE,
++    };
++    unsigned int desired_buffers;
+     unsigned int index;
+     int status;
+ 
+@@ -292,9 +296,20 @@ static int setup_capture(struct venus_v4l2_decoder *decoder)
+     if (status < 0)
+         return status;
+ 
++    desired_buffers = decoder->requested_capture_buffers;
++    if (xioctl(decoder->fd, VIDIOC_G_CTRL, &min_buffers) == 0 &&
++        min_buffers.value > 0) {
++        unsigned int needed = (unsigned int)min_buffers.value + 2u;
++
++        if (needed > desired_buffers)
++            desired_buffers = needed;
++    }
++    if (desired_buffers > 32u)
++        desired_buffers = 32u;
++
+     status = request_and_map(
+         decoder, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+-        decoder->requested_capture_buffers, &decoder->capture,
++        desired_buffers, &decoder->capture,
+         &decoder->capture_count);
+     if (status < 0)
+         return status;
+@@ -392,21 +407,31 @@ int venus_v4l2_decoder_open(
+     if (status < 0)
+         goto fail;
+ 
+-    if (decoder->coded_format == V4L2_PIX_FMT_HEVC) {
++    /*
++     * Request decode-order zero-delay output so stateful Venus does not
++     * hold B-frames in an internal reorder queue behind VA-API's own DPB.
++     */
++    {
+         struct v4l2_control delay = {
+             .id = V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY,
+             .value = 0,
+         };
++        bool required = (decoder->coded_format == V4L2_PIX_FMT_HEVC);
+ 
+         if (xioctl(decoder->fd, VIDIOC_S_CTRL, &delay) < 0) {
+-            status = decoder_error(decoder, "S_CTRL(DISPLAY_DELAY)");
+-            goto fail;
+-        }
+-        delay.id = V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY_ENABLE;
+-        delay.value = 1;
+-        if (xioctl(decoder->fd, VIDIOC_S_CTRL, &delay) < 0) {
+-            status = decoder_error(decoder, "S_CTRL(DISPLAY_DELAY_ENABLE)");
+-            goto fail;
++            if (required) {
++                status = decoder_error(decoder, "S_CTRL(DISPLAY_DELAY)");
++                goto fail;
++            }
++        } else {
++            delay.id = V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY_ENABLE;
++            delay.value = 1;
++            if (xioctl(decoder->fd, VIDIOC_S_CTRL, &delay) < 0 &&
++                required) {
++                status = decoder_error(
++                    decoder, "S_CTRL(DISPLAY_DELAY_ENABLE)");
++                goto fail;
++            }
+         }
+     }
+ 
+@@ -507,19 +532,22 @@ static int dequeue_capture(struct venus_v4l2_decoder *decoder,
+                 decoder->capture_format.plane_fmt[0].bytesperline,
+         };
+ 
+-        if (frame.size > 0 && callback) {
++        status = 0;
++        if (frame.size > 0 && callback)
+             status = callback(&frame, opaque);
+-            if (status < 0)
+-                return status;
+-        }
+ 
+         if (buffer.flags & V4L2_BUF_FLAG_LAST) {
+             if (end_of_stream)
+                 *end_of_stream = true;
+-            return 0;
++            return status < 0 ? status : 0;
+         }
+ 
+-        status = queue_capture(decoder, buffer.index);
++        {
++            int qstatus = queue_capture(decoder, buffer.index);
++
++            if (qstatus < 0)
++                return qstatus;
++        }
+         if (status < 0)
+             return status;
+     }
+@@ -548,32 +576,15 @@ static int dequeue_events(struct venus_v4l2_decoder *decoder,
+             int status;
+ 
+             decoder->source_changes++;
+-            if (!decoder->capture_streaming) {
+-                status = setup_capture(decoder);
+-                if (status < 0)
+-                    return status;
+-            } else {
+-                struct v4l2_format format = {
+-                    .type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+-                };
+-
+-                if (xioctl(decoder->fd, VIDIOC_G_FMT, &format) < 0)
+-                    return decoder_error(
+-                        decoder,
+-                        "VIDIOC_G_FMT(CAPTURE source-change)");
+-
+-                if (format.fmt.pix_mp.pixelformat !=
+-                        decoder->requested_raw_format ||
+-                    format.fmt.pix_mp.num_planes != 1 ||
+-                    format.fmt.pix_mp.plane_fmt[0].sizeimage >
+-                        decoder->capture[0].length) {
+-                    errno = EOVERFLOW;
+-                    return decoder_error(
+-                        decoder, "dynamic capture format");
+-                }
+-
+-                decoder->capture_format = format.fmt.pix_mp;
++            if (decoder->capture_streaming) {
++                stream_off(decoder, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
++                decoder->capture_streaming = false;
++                release_buffers(decoder, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
++                                &decoder->capture, &decoder->capture_count);
+             }
++            status = setup_capture(decoder);
++            if (status < 0)
++                return status;
+         }
+     }
+ }
+@@ -584,7 +595,9 @@ int venus_v4l2_decoder_pump(struct venus_v4l2_decoder *decoder,
+                             void *opaque, bool *end_of_stream)
+ {
+     struct pollfd poll_fd;
++    bool all_output_queued = true;
+     bool made_progress = false;
++    unsigned int index;
+     int status;
+ 
+     if (!decoder || decoder->fd < 0 || timeout_ms < 0)
+@@ -593,9 +606,22 @@ int venus_v4l2_decoder_pump(struct venus_v4l2_decoder *decoder,
+     if (end_of_stream)
+         *end_of_stream = false;
+ 
++    /*
++     * Only poll POLLOUT when every OUTPUT slot is queued; otherwise vb2
++     * signals POLLOUT immediately and causes a 100% CPU busy-spin while
++     * waiting for a CAPTURE frame.
++     */
++    for (index = 0; index < decoder->output_count; index++) {
++        if (!decoder->output[index].queued) {
++            all_output_queued = false;
++            break;
++        }
++    }
++
+     poll_fd = (struct pollfd) {
+         .fd = decoder->fd,
+-        .events = POLLIN | POLLOUT | POLLPRI,
++        .events = (short)(POLLIN | POLLPRI |
++                          (all_output_queued ? POLLOUT : 0)),
+     };
+ 
+     do {

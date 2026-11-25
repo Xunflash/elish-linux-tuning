@@ -1,0 +1,9 @@
+# Recommended Chromium / Google Chrome flags for Xiaomi Mi Pad 5 Pro (xiaomi-elish)
+# with patched Qualcomm Venus VA-API driver (/usr/lib/aarch64-linux-gnu/dri/venus_drv_video.so)
+#
+# Append to Exec= in ~/.local/share/applications/google-chrome.desktop
+# (or place one flag per line in ~/.config/chrome-flags.conf if your launcher reads it):
+--enable-features=AcceleratedVideoDecodeLinuxGL,AcceleratedVideoDecodeLinuxZeroCopyGL,VaapiIgnoreDriverChecks
+--enable-gpu-rasterization
+--disable-lcd-text
+--disable-font-subpixel-positioning

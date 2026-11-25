@@ -1,0 +1,10 @@
+# sched_ext BPF scheduler configuration for Xiaomi Mi Pad 5 Pro (xiaomi-elish / SM8250-AC)
+# Winner of 8-way benchmark vs Native EEVDF, scx_lavd, scx_cake, scx_flash, scx_pandemonium, scx_bpfland:
+#   scx_cosmos -m 4-7 -P --time-preemption
+#   - Primary domain: cpu4-7 (4x Cortex-A77 big/prime), spills to cpu0-3 (A55) when overloaded >1ms
+#   - -P: preferred idle scan [7,4,5,6,0,1,2,3]
+#   - --time-preemption: hrtimer preemption for sub-1ms wakeup latency
+#   - Built-in BPF cpuperf scaling works cleanly with stock min_freq (710M/844M) for lower idle power
+# Disable anytime: sudo systemctl disable --now scx.service
+SCX_SCHEDULER=/usr/local/bin/scx_cosmos
+SCX_FLAGS="-m 4-7 -P --time-preemption"

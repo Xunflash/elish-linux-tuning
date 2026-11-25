@@ -1,0 +1,11 @@
+[Unit]
+Description=Apply elish runtime cpuidle tuning (TEO governor)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'if grep -qw teo /sys/devices/system/cpu/cpuidle/available_governors 2>/dev/null; then echo teo > /sys/devices/system/cpu/cpuidle/current_governor; fi'
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+# Recommended settings for /etc/default/armbian-zram-config on Xiaomi Mi Pad 5 Pro (12GB RAM)
+# Fast LZ4 primary compression keeps hot swap latency tiny; elish-zram-recomp.timer
+# periodically recompresses cold/idle pages using zstd when CONFIG_ZRAM_MULTI_COMP=y.
+ENABLED=true
+ZRAM_PERCENTAGE=100
+MEM_LIMIT_PERCENTAGE=50
+SWAP_ALGORITHM=lz4
